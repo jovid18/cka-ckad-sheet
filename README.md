@@ -2006,3 +2006,714 @@ k apply -f net-pol-3.yaml
 3. 문제에서 "허용할 출발지" 하나만 명시되면 → 그 ns만 selector에 두는 정책이 가장 제한적
 4. `access=allowed` 같은 메타 라벨에 의존하면 다른 ns가 같은 라벨을 달기만 해도 통과돼서 위험
 5. 기존 정책 건드리지 말라는 지시 → `k apply -f` 로 새 정책 추가만, `delete` 금지
+
+# Mock Test 3
+
+## Case 1) kubeadm용 sysctl 파라미터 영구 적용
+
+> You are an administrator preparing your environment to deploy a Kubernetes cluster using `kubeadm`. Adjust the following network parameters on the system to the following values, and make sure your changes persist reboots:
+>
+> - `net.ipv4.ip_forward = 1`
+> - `net.bridge.bridge-nf-call-iptables = 1`
+
+### 1. 어디에 써야 영구 적용되는가
+
+런타임에만 박는 `sysctl -w` 는 재부팅 후 날아감. **`/etc/sysctl.d/*.conf`** 에 적어두면 부팅 시 자동 재적용됨. kubeadm 공식 문서가 안내하는 패턴 그대로.
+
+참고: https://kubernetes.io/docs/setup/production-environment/container-runtimes/
+
+### 2. 파일 생성 + 즉시 적용
+
+```bash
+# 영구 설정 파일 작성
+cat <<EOF | sudo tee /etc/sysctl.d/k8s.conf
+net.ipv4.ip_forward = 1
+net.bridge.bridge-nf-call-iptables = 1
+EOF
+
+# 재부팅 없이 바로 적용
+sudo sysctl --system
+```
+
+### 3. 적용 확인
+
+```bash
+sysctl net.ipv4.ip_forward net.bridge.bridge-nf-call-iptables
+# net.ipv4.ip_forward = 1
+# net.bridge.bridge-nf-call-iptables = 1
+```
+
+> 💡 `sysctl --system` 은 `/etc/sysctl.d/`, `/usr/lib/sysctl.d/`, `/etc/sysctl.conf` 를 전부 재로딩. 출력에 다른 파일 경고가 잔뜩 나와도 마지막에 `k8s.conf` 가 적용되면 OK.
+> 💡 `bridge-nf-call-iptables` 가 먹으려면 `br_netfilter` 모듈이 로드돼 있어야 함. kubeadm pre-flight 단계에서 보통 `/etc/modules-load.d/k8s.conf` 에 `br_netfilter` 도 같이 등록함 (이 문제는 sysctl만 묻고 있어서 생략).
+
+---
+
+## Case 2) ServiceAccount + ClusterRole + Pod 연결
+
+> Create a new service account with the name `pvviewer`. Grant this Service account access to list all PersistentVolumes in the cluster by creating an appropriate cluster role called `pvviewer-role` and ClusterRoleBinding called `pvviewer-role-binding`.
+> Next, create a pod called `pvviewer` with the image: `redis` and serviceAccount: `pvviewer` in the default namespace.
+
+### 1. SA → ClusterRole → ClusterRoleBinding 순서로 imperative 생성
+
+전부 명령형으로 가능. PV는 클러스터 스코프 리소스라서 **Role이 아니라 ClusterRole** 필요.
+
+```bash
+# 1) ServiceAccount
+kubectl create serviceaccount pvviewer
+
+# 2) ClusterRole — list verb on persistentvolumes
+kubectl create clusterrole pvviewer-role \
+  --verb=list --resource=persistentvolumes
+
+# 3) ClusterRoleBinding — SA는 ns:name 형태로
+kubectl create clusterrolebinding pvviewer-role-binding \
+  --clusterrole=pvviewer-role \
+  --serviceaccount=default:pvviewer
+```
+
+### 2. Pod에 serviceAccount 박기
+
+`kubectl run` 으로는 `--serviceaccount` 플래그가 없으니 dry-run 으로 yaml 뽑아 수정.
+
+```bash
+k run pvviewer --image=redis --dry-run=client -o yaml > pvviewer.yaml
+```
+
+```yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  labels:
+    run: pvviewer
+  name: pvviewer
+spec:
+  serviceAccountName: pvviewer # ← 추가
+  containers:
+    - image: redis
+      name: pvviewer
+```
+
+```bash
+k apply -f pvviewer.yaml
+```
+
+> 💡 `--serviceaccount=<ns>:<name>` 포맷 절대 헷갈리지 말 것. ns 생략하면 default로 가긴 하지만 명시하는 게 안전.
+> 💡 verb는 `list` 만 요구함. `get`, `watch` 까지 안 줘도 됨 — 시험 문제 그대로 최소로 맞춰주는 게 정답.
+
+---
+
+## Case 3) StorageClass 만들기 (rancher-sc)
+
+> Create a StorageClass named `rancher-sc` with the following specifications:
+>
+> - The provisioner should be `rancher.io/local-path`
+> - The volume binding mode should be `WaitForFirstConsumer`
+> - Volume expansion should be enabled
+
+### manifest
+
+StorageClass는 imperative 생성 명령이 없어서 yaml 직접 작성.
+
+```yaml
+# rancher-sc.yaml
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: rancher-sc
+provisioner: rancher.io/local-path
+allowVolumeExpansion: true
+volumeBindingMode: WaitForFirstConsumer
+```
+
+```bash
+k apply -f rancher-sc.yaml
+k get sc rancher-sc
+```
+
+> 💡 `volumeBindingMode` 와 `allowVolumeExpansion` 은 `spec` 안이 아니라 **최상위 필드**. `parameters:` 자리에 넣으면 안 됨 — 자주 틀리는 부분.
+
+---
+
+## Case 4) ConfigMap → Deployment envFrom 주입
+
+> Create a ConfigMap named `app-config` in the namespace `cm-namespace` with the following key-value pairs:
+>
+> - `ENV=production`
+> - `LOG_LEVEL=info`
+>
+> Then, modify the existing Deployment named `cm-webapp` in the same namespace to use the `app-config` ConfigMap by setting the environment variables `ENV` and `LOG_LEVEL` in the container from the ConfigMap.
+
+### 1. ConfigMap 생성
+
+imperative로도 됨: `k -n cm-namespace create cm app-config --from-literal=ENV=production --from-literal=LOG_LEVEL=info`. yaml 쪽이 더 명확함:
+
+```yaml
+# app-config.yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: app-config
+  namespace: cm-namespace
+data:
+  ENV: 'production'
+  LOG_LEVEL: 'info'
+```
+
+```bash
+k apply -f app-config.yaml
+```
+
+### 2. Deployment에 envFrom 주입
+
+키 이름 두 개를 그대로 env 변수로 매핑하면 되니까 `env:` 개별 매핑 대신 **`envFrom:`** 한 줄이면 끝.
+
+```bash
+k -n cm-namespace edit deployment cm-webapp
+```
+
+```yaml
+spec:
+  template:
+    spec:
+      containers:
+        - name: nginx
+          image: nginx
+          envFrom:
+            - configMapRef:
+                name: app-config
+```
+
+> 💡 `envFrom` 은 ConfigMap의 모든 key를 컨테이너 env로 통째로 import. 두 개만 골라 쓰려면 `env: - valueFrom.configMapKeyRef` 로 명시. 이번 문제는 키 두 개가 전부니까 envFrom이 짧고 깔끔.
+> 💡 Deployment를 edit 하면 자동으로 새 ReplicaSet으로 롤링됨 — 별도 `rollout restart` 불필요.
+
+---
+
+## Case 5) PriorityClass 적용 (기존 Pod 재생성 필요)
+
+> Create a PriorityClass named `low-priority` with a value of `50000`. A pod named `lp-pod` exists in the namespace `low-priority`. Modify the pod to use the priority class you created. Recreate the pod if necessary.
+
+### 1. PriorityClass 생성
+
+```bash
+kubectl create priorityclass low-priority --value=50000
+```
+
+### 2. 기존 Pod의 priorityClassName은 immutable
+
+Pod의 `spec.priorityClassName` (그리고 자동 계산된 `priority`) 은 **생성 후 수정 불가**. `k edit` 으로 바꾸려고 하면 reject 됨 → 문제도 "Recreate the pod if necessary" 라고 미리 힌트를 줌.
+
+```bash
+# 현재 spec 덤프
+k -n low-priority get pod lp-pod -o yaml > lp-pod.yaml
+```
+
+`lp-pod.yaml` 에서 정리할 것:
+
+- `status:`, `metadata.creationTimestamp`, `resourceVersion`, `uid` 등 **런타임 필드 전부 제거**
+- `spec.priority: 0` 줄 **삭제** (priorityClassName으로부터 자동 계산되어야 함)
+- `spec.priorityClassName: low-priority` **추가**
+
+```yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: lp-pod
+  namespace: low-priority
+  labels:
+    run: lp-pod
+spec:
+  priorityClassName: low-priority # ← 추가
+  containers:
+    - image: nginx
+      name: lp-pod
+  # ... 나머지 spec 유지
+```
+
+### 3. 삭제 후 재생성
+
+```bash
+k -n low-priority delete pod lp-pod --force
+k apply -f lp-pod.yaml
+
+k get pod -n low-priority
+# lp-pod   1/1   Running   0   18s
+```
+
+> ⚠️ `priority` 와 `priorityClassName` 둘 다 immutable. 덤프한 yaml에 `priority: 0` 이 남아있으면 새 우선순위와 충돌나거나 무시될 수 있음 → **삭제하고 priorityClassName만 남기는 게 안전**.
+> 💡 `--force` 는 grace period 0 으로 즉시 삭제. 시험에선 시간 아끼려고 자주 쓰지만, 실무에선 데이터 정합성 위험.
+
+---
+
+## Case 6) NetworkPolicy — 모든 출발지 허용 (port 80)
+
+> A pod called `np-test-1` and a service called `np-test-service` have been deployed in the default namespace. A default-deny NetworkPolicy is currently blocking all ingress traffic to pods in this namespace, which is why the service is unreachable.
+>
+> Create a new NetworkPolicy named `ingress-to-nptest` in the default namespace that allows ingress traffic from all sources to the `np-test-1` pod on port 80.
+>
+> **Important:** Don't delete any current objects deployed.
+
+### 1. 핵심: `from:` 자체를 비우면 "모든 출발지 허용"
+
+`from:` 을 명시하지 않은 `ingress` 룰은 **모든 namespace / 모든 pod / 모든 IP 에서의 트래픽을 허용**. `ports:` 만 적으면 됨.
+
+```yaml
+# ingress-to-nptest.yaml
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: ingress-to-nptest
+  namespace: default
+spec:
+  podSelector:
+    matchLabels:
+      run: np-test-1
+  policyTypes:
+    - Ingress
+  ingress:
+    - ports:
+        - protocol: TCP
+          port: 80
+```
+
+```bash
+k apply -f ingress-to-nptest.yaml
+```
+
+### 2. 확인
+
+```bash
+kubectl describe networkpolicy ingress-to-nptest
+# Allowing ingress traffic:
+#   To Port: 80/TCP
+#   From: <any> (traffic not restricted by source)
+```
+
+`From: <any>` 가 핵심 — 출발지 제한이 없다는 뜻.
+
+> 💡 default-deny는 그대로 두고 **새 정책을 추가만** 함. NetworkPolicy는 여러 개가 OR 로 합쳐지므로, 더 느슨한 정책 하나만 추가하면 그쪽으로 트래픽이 뚫림.
+> ⚠️ "Don't delete any current objects" 지시 → default-deny 건드리면 감점. `delete` 금지, `apply` 만.
+
+---
+
+## Case 7) Taint + Toleration 으로 스케줄 분리
+
+> Taint the worker node `node01` to be Unschedulable. Once done, create a pod called `dev-redis`, image `redis:alpine`, to ensure workloads are not scheduled to this worker node. Finally, create a new pod called `prod-redis` and image: `redis:alpine` with toleration to be scheduled on `node01`.
+>
+> - `key: env_type`, `value: production`, `operator: Equal`, `effect: NoSchedule`
+
+### 1. 노드 taint
+
+```bash
+kubectl taint nodes node01 env_type=production:NoSchedule
+```
+
+### 2. dev-redis — toleration 없음 (node01 회피)
+
+toleration이 없으니 알아서 다른 노드(controlplane 등)로 스케줄됨.
+
+```bash
+k run dev-redis --image=redis:alpine
+```
+
+### 3. prod-redis — toleration 추가 (node01 허용)
+
+`kubectl run` 으로는 toleration 지정 불가 → dry-run 으로 yaml 뽑고 수정.
+
+```bash
+k run prod-redis --image=redis:alpine --dry-run=client -o yaml > prod-redis.yaml
+```
+
+```yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: prod-redis
+  labels:
+    run: prod-redis
+spec:
+  containers:
+    - image: redis:alpine
+      name: prod-redis
+  tolerations:
+    - key: 'env_type'
+      operator: 'Equal'
+      value: 'production'
+      effect: 'NoSchedule'
+```
+
+```bash
+k apply -f prod-redis.yaml
+```
+
+### 4. 배치 확인
+
+```bash
+k get pods -o wide
+# dev-redis    Running   controlplane
+# prod-redis   Running   node01
+```
+
+> 💡 Toleration의 4개 필드 (`key`, `operator`, `value`, `effect`) 는 taint와 **정확히 일치**해야 매칭. `operator: Exists` 면 `value` 생략 가능하지만, 문제에서 `Equal` 을 못박았으니 `value` 도 필수.
+> ⚠️ Toleration은 "그 노드에 스케줄돼도 된다"는 허가일 뿐, **강제하지 않음**. 스케줄러가 다른 노드로 보낼 수도 있음. 강제로 node01에 박고 싶다면 `nodeSelector` 나 `nodeName` 을 같이 줘야 함 (이 문제는 요구 안 함).
+> ⚠️ dry-run 출력의 metadata.name/labels 가 의도와 다르게 나오면 (예: `name: pod`) 직접 `prod-redis` 로 고쳐줄 것 — 안 그러면 다른 이름으로 생성됨.
+
+---
+
+## Case 8) PVC ↔ PV 바인딩 실패 (accessModes 불일치)
+
+> A PersistentVolumeClaim named `app-pvc` exists in the namespace `storage-ns`, but it is not getting bound to the available PersistentVolume named `app-pv`. Inspect both the PVC and PV and identify why the PVC is not being bound and fix the issue so that the PVC successfully binds to the PV. **Do not modify the PV resource.**
+
+### 1. PVC / PV 양쪽 스펙 비교
+
+```bash
+k -n storage-ns get pvc app-pvc -o yaml
+k get pv app-pv -o yaml
+```
+
+| 항목         | PV (`app-pv`) | PVC (`app-pvc`) |
+| ------------ | ------------- | --------------- |
+| storage      | 1Gi           | 1Gi             |
+| accessModes  | **RWO**       | **RWM**         |
+| volumeMode   | Filesystem    | Filesystem      |
+| storageClass | (없음)        | (없음)          |
+
+→ `accessModes` 불일치. PV는 RWO인데 PVC가 RWM 요구 → 매칭 실패. 문제에서 "Do not modify the PV" 라고 못박았으니 **PVC 쪽을 RWO로 바꿈**.
+
+### 2. PVC를 RWO로 재생성
+
+PVC는 한번 만들어지면 `accessModes` 같은 핵심 필드를 in-place로 못 고침 → **삭제 후 재생성**.
+
+```bash
+k -n storage-ns delete pvc app-pvc
+```
+
+```yaml
+# app-pvc.yaml
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: app-pvc
+  namespace: storage-ns
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 1Gi
+  volumeMode: Filesystem
+```
+
+```bash
+k apply -f app-pvc.yaml
+```
+
+### 3. 바인딩 확인
+
+```bash
+k -n storage-ns get pvc
+# NAME      STATUS   VOLUME   CAPACITY   ACCESS MODES
+# app-pvc   Bound    app-pv   1Gi        RWO
+```
+
+> 💡 PVC ↔ PV 바인딩 매칭 조건: `storage`(요청 ≤ 용량), `accessModes`(요청이 PV가 지원하는 모드 안에 들어가야 함), `storageClassName`, `volumeMode`, `selector` 다섯 가지. `Pending` 이면 이 다섯부터 비교.
+> ⚠️ "Do not modify the PV" 같은 단서가 있을 땐 어느 쪽을 손대야 하는지 이미 정해진 것 — 일치 방향 헷갈리지 말 것.
+
+---
+
+## Case 9) super.kubeconfig 포트 오류 수정
+
+> A kubeconfig file called `super.kubeconfig` has been created under `/root/CKA`. There is something wrong with the configuration. Troubleshoot and fix it.
+
+### 1. kubeconfig server 주소 의심
+
+```bash
+cat /root/CKA/super.kubeconfig
+# server: https://controlplane:9999    ← 의심
+```
+
+### 2. 실제 kube-apiserver 포트 확인
+
+```bash
+k describe pod kube-apiserver-controlplane -n kube-system | grep -i port
+#   Port:      6443/TCP (probe-port)
+#   Host Port: 6443/TCP (probe-port)
+#     --secure-port=6443
+```
+
+apiserver는 6443에서 listen — kubeconfig의 `9999` 가 잘못됨.
+
+### 3. 포트를 6443으로 수정
+
+`server: https://controlplane:6443` 으로 변경 후 검증:
+
+```bash
+k --kubeconfig=/root/CKA/super.kubeconfig get nodes
+```
+
+> 💡 kubeconfig 트러블슈팅 순서: ① `server:` URL/포트 → ② `certificate-authority` 경로 → ③ `user:` 의 client-cert/token → ④ `context:` 가 가리키는 cluster/user 이름이 실제로 정의돼 있는지. 위에서부터 차례로 확인하면 거의 다 잡힘.
+
+---
+
+## Case 10) Deployment scale 안 됨 — kube-controller-manager 망가짐
+
+> We have created a new deployment called `nginx-deploy`. Scale the deployment to 3 replicas. Has the number of replicas increased? Troubleshoot and fix the issue.
+
+### 1. 일단 스케일 명령
+
+```bash
+k scale deploy nginx-deploy --replicas=3
+# deployment.apps/nginx-deploy scaled
+
+k get deploy nginx-deploy
+# NAME           READY   UP-TO-DATE   AVAILABLE
+# nginx-deploy   1/3     1            1
+```
+
+Deployment의 `spec.replicas` 는 3으로 반영됐는데 ReplicaSet은 여전히 `desired: 1`. HPA도 없음 → **컨트롤러가 일을 안 하는 상황**.
+
+```bash
+k get deploy nginx-deploy -o yaml | grep -A2 "^spec:"
+# spec:
+#   progressDeadlineSeconds: 600
+#   replicas: 3        ← Deployment 자체는 3 요구
+
+k get hpa
+# No resources found
+
+k describe rs <rs-name>
+# Annotations: deployment.kubernetes.io/desired-replicas: 1   ← RS는 1만 desired
+```
+
+### 2. control plane 컴포넌트 점검
+
+```bash
+k get pods -n kube-system
+# kube-controller-manager-controlplane   0/1   CrashLoopBackOff   6 (42s ago)
+```
+
+→ Deployment → ReplicaSet 동기화를 담당하는 `kube-controller-manager` 가 죽어 있음.
+
+### 3. CrashLoopBackOff 원인
+
+```bash
+k describe pod kube-controller-manager-controlplane -n kube-system
+# Command:
+#   kube-contro1ler-manager        ← 'l' 자리에 숫자 '1'
+# Message: exec: "kube-contro1ler-manager": executable file not found in $PATH
+```
+
+### 4. static pod manifest 수정
+
+```bash
+vim /etc/kubernetes/manifests/kube-controller-manager.yaml
+```
+
+```yaml
+spec:
+  containers:
+    - command:
+        - kube-controller-manager # contro1ler → controller
+        - --allocate-node-cidrs=true
+        # ...
+```
+
+저장하면 kubelet이 static pod을 자동 재기동.
+
+### 5. 결과 확인
+
+```bash
+k get pods -n kube-system
+# kube-controller-manager-controlplane   1/1   Running
+
+k get pods
+# nginx-deploy-99bcf7fdc-4nbht   1/1   Running
+# nginx-deploy-99bcf7fdc-n8hhh   1/1   Running
+# nginx-deploy-99bcf7fdc-njzs9   1/1   Running
+```
+
+> ⚠️ Deployment `spec.replicas` 만 늘어나고 ReplicaSet이 따라오지 않으면 → **`kube-controller-manager` 상태부터**. Deployment 컨트롤러는 controller-manager 안에서 돈다.
+> 💡 시험에서 `1`↔`l`, `0`↔`O`, `I`↔`l` 같은 글리프 함정이 흔함. `cat` 결과만 슥 보지 말고, command나 path는 한 글자씩 비교하거나 `which kube-controller-manager` 같이 실제로 실행 가능한지 따져볼 것.
+
+---
+
+## Case 11) HPA — 커스텀 메트릭 (Pods 타입)
+
+> Create a Horizontal Pod Autoscaler `api-hpa` for `api-deployment` in the `api` namespace. Scale based on a custom metric `requests_per_second`, targeting an average value of 1000 across all pods. `minReplicas: 1`, `maxReplicas: 20`. Ignore errors due to metric not being tracked.
+
+### 1. 커스텀 메트릭은 `autoscaling/v2` 필수
+
+`autoscaling/v1` 은 CPU 비율만 지원. 커스텀 메트릭/메모리/외부 메트릭은 모두 `autoscaling/v2`.
+공식 문서 [HPA walkthrough](https://kubernetes.io/docs/tasks/run-application/horizontal-pod-autoscale-walkthrough/) 의 `Pods` 타입 예시를 그대로 차용.
+
+### 2. manifest 작성
+
+```yaml
+# api-hpa.yaml
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: api-hpa
+  namespace: api
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: api-deployment
+  minReplicas: 1
+  maxReplicas: 20
+  metrics:
+    - type: Pods
+      pods:
+        metric:
+          name: requests_per_second
+        target:
+          type: AverageValue
+          averageValue: 1k
+```
+
+```bash
+k apply -f api-hpa.yaml
+```
+
+| `metric.type` | 용도                                       | target 종류                    |
+| ------------- | ------------------------------------------ | ------------------------------ |
+| `Resource`    | CPU/Memory (내장)                          | `Utilization` / `AverageValue` |
+| `Pods`        | Pod 당 평균값 (이 케이스)                  | `AverageValue` 만              |
+| `Object`      | 단일 오브젝트 (예: Ingress 의 qps)         | `Value` / `AverageValue`       |
+| `External`    | 클러스터 외부 (SQS 큐, 클라우드 메트릭 등) | `Value` / `AverageValue`       |
+
+> 💡 "average value of 1000 across all pods" 같은 워딩 → `Pods` + `AverageValue: 1k`. `Utilization`(%) 은 `Resource` 타입에서만 쓰임.
+> ⚠️ `averageValue: 1000` 도 동일 의미지만 시험에서는 `1k` 표기가 더 흔함 — 채점기는 둘 다 받음.
+
+---
+
+## Case 12) HTTPRoute 가중치 기반 트래픽 분기
+
+> Configure the `web-route` to split traffic between `web-service` and `web-service-v2`. 80% → `web-service`, 20% → `web-service-v2`. Gateway/Service 들은 이미 생성돼 있음.
+
+### 1. 환경 확인
+
+```bash
+k get gateway
+# web-gateway   nginx   True   28s
+
+k get svc
+# web-service       ClusterIP   ...   80/TCP
+# web-service-v2    ClusterIP   ...   80/TCP
+```
+
+### 2. HTTPRoute 작성 (`backendRefs[].weight`)
+
+```yaml
+# web-route.yaml
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: web-route
+  labels:
+    gateway: web-gateway
+spec:
+  parentRefs:
+    - name: web-gateway
+  rules:
+    - backendRefs:
+        - name: web-service
+          port: 80
+          weight: 80
+        - name: web-service-v2
+          port: 80
+          weight: 20
+```
+
+```bash
+k apply -f web-route.yaml
+```
+
+### 3. 채택 확인
+
+```bash
+k describe httproute web-route
+# Status:
+#   Parents:
+#     Conditions:
+#       Reason: Accepted        ← 게이트웨이가 라우트 수락
+#       Reason: ResolvedRefs    ← 백엔드 Service 매칭 성공
+```
+
+> 💡 `weight` 는 퍼센트가 아니라 **상대값**. 80/20 이든 8/2 든 4/1 이든 결과 동일. 다만 문제에서 퍼센트로 요구하면 그대로 80/20 으로 적는 게 안전 (채점 정규식에 걸릴 가능성).
+> ⚠️ `Accepted: True` 만 보고 끝내지 말 것. `ResolvedRefs` 가 False 면 backend Service 이름/네임스페이스/포트 오타 가능성.
+
+---
+
+## Case 13) Helm — 새 chart로 release 교체 (blue-green)
+
+> `webpage-server-01` 이 Helm으로 배포돼 있음. `/root/new-version` 에 새 버전 chart가 있음. 검증 → `webpage-server-02` 라는 **새 release** 로 설치 → 확인 후 `webpage-server-01` 제거.
+
+### 1. 현재 release 확인
+
+```bash
+helm list
+# NAME                REVISION   CHART                     APP VERSION
+# webpage-server-01   1          webpage-server-01-0.1.0   v1
+```
+
+### 2. 새 chart 검증
+
+```bash
+helm lint /root/new-version/
+# [INFO] Chart.yaml: icon is recommended
+# 1 chart(s) linted, 0 chart(s) failed
+```
+
+`failed: 0` 이면 통과. `INFO`/`WARNING` 은 경고일 뿐 막지 않음.
+
+### 3. 새 release 설치
+
+```bash
+helm install webpage-server-02 /root/new-version/
+# STATUS: deployed
+# REVISION: 1
+
+helm list
+# webpage-server-01   1   webpage-server-01-0.1.0   v1
+# webpage-server-02   1   webpage-server-02-0.1.1   v2
+```
+
+### 4. 새 release Pod이 Running 인 걸 확인한 뒤 구 release 제거
+
+```bash
+k get pods | grep webpage
+# webpage-server-02-...   1/1   Running
+
+helm uninstall webpage-server-01
+# release "webpage-server-01" uninstalled
+```
+
+> 💡 `helm upgrade webpage-server-01 /root/new-version` 이 아니라 **새 release 이름으로 install** 하는 게 문제의 요구. 두 release 가 잠시 공존하다 구버전을 내리는 blue-green 패턴.
+> ⚠️ uninstall 전에 반드시 새 release 의 Pod 가 `Running` 상태인지 먼저 확인 — 안 그러면 다운타임 발생.
+
+---
+
+## Case 14) Pod CIDR — kubeadm-config ConfigMap 에서 추출
+
+> CNI 설치 전 cluster-wide Pod network CIDR을 확인. `kubeadm-config` ConfigMap의 `podSubnet` 값을 `x.x.x.x/x` 형식으로 `/root/pod-cidr.txt` 에 저장. (per-node CIDR 아님)
+
+### 1. ConfigMap 에서 값 뽑기
+
+```bash
+k describe configmap kubeadm-config -n kube-system | grep -i podSubnet
+#   podSubnet: 172.17.0.0/16
+```
+
+### 2. 파일에 CIDR 만 저장
+
+```bash
+echo "172.17.0.0/16" > /root/pod-cidr.txt
+```
+
+> 💡 헷갈리는 두 종류
+>
+> - **cluster-wide podSubnet** (`kubeadm-config` ConfigMap) → CNI 에 알려줄 값. 이 케이스의 정답.
+> - **per-node podCIDR** (`k get node -o jsonpath='{.items[*].spec.podCIDR}'`) → 각 노드에 잘라 할당된 슬라이스. 항상 cluster-wide 의 부분집합.
+>
+> ⚠️ 문제의 Note 가 명시적으로 `kubectl get node` 의 값이 아니라고 짚는 이유 — 둘 중 무엇을 묻는지 헷갈리지 말 것.
