@@ -1255,3 +1255,754 @@ k -n kk-ns get deployments.apps
 3. `helm upgrade <release> <repo>/<chart> --version <ver> -n <ns>` — release / chart / namespace 셋 다 정확히
 4. 결과는 `helm list -n <ns>`의 `REVISION` 증가 + `CHART` 버전 변경으로 확인
 5. 롤백 필요하면 `helm rollback <release> <revision>`
+
+# Mock Test 2
+
+## Case 1) Default StorageClass 생성 (no-provisioner)
+
+> Create a StorageClass named `local-sc` with the following specifications and set it as the default storage class:
+>
+> - The provisioner should be `kubernetes.io/no-provisioner`
+> - The volume binding mode should be `WaitForFirstConsumer`
+> - Volume expansion should be enabled
+
+### 1. 핵심 필드 정리
+
+| 항목                   | 값                                                               |
+| ---------------------- | ---------------------------------------------------------------- |
+| `provisioner`          | `kubernetes.io/no-provisioner` (수동 PV 바인딩용)                |
+| `volumeBindingMode`    | `WaitForFirstConsumer` (Pod 스케줄 후 바인딩)                    |
+| `allowVolumeExpansion` | `true`                                                           |
+| default 지정           | annotation `storageclass.kubernetes.io/is-default-class: "true"` |
+
+### 2. manifest 작성 & 적용
+
+```yaml
+# local-sc.yaml
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: local-sc
+  annotations:
+    storageclass.kubernetes.io/is-default-class: 'true'
+provisioner: kubernetes.io/no-provisioner
+allowVolumeExpansion: true
+volumeBindingMode: WaitForFirstConsumer
+```
+
+```bash
+k apply -f local-sc.yaml
+
+k get sc
+# local-sc (default)   kubernetes.io/no-provisioner   ...   WaitForFirstConsumer   true   ...
+```
+
+> 💡 default StorageClass는 어디까지나 **annotation**으로 지정. `spec` 필드가 따로 있는 게 아님.
+> 💡 `no-provisioner`는 동적 프로비저닝 안 함 → PV를 수동으로 만들어 줘야 PVC가 바인딩됨. `WaitForFirstConsumer`와 함께 쓰는 게 local volume의 정석 패턴.
+
+---
+
+## Case 2) Sidecar 컨테이너로 로그 tail (Deployment)
+
+> Create a deployment named `logging-deployment` in the namespace `logging-ns` with 1 replica:
+>
+> - Main container `app-container` (image `busybox`) runs: `sh -c "while true; do echo 'Log entry' >> /var/log/app/app.log; sleep 5; done"`
+> - Sidecar container `log-agent` (image `busybox`) runs: `tail -f /var/log/app/app.log`
+> - `log-agent` logs should display the entries logged by `app-container`.
+
+### 1. 사이드카는 native sidecar (initContainer + restartPolicy: Always) 패턴
+
+K8s 1.28+ 부터 `initContainers`에 `restartPolicy: Always`를 주면 **메인 컨테이너와 같이 동작하는 사이드카**가 됨. 메인보다 먼저 시작하고, 메인이 죽어도 같이 안 죽는 게 장점.
+
+### 2. manifest
+
+```yaml
+# logging-deployment.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: logging-deployment
+  namespace: logging-ns
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: logger
+  template:
+    metadata:
+      labels:
+        app: logger
+    spec:
+      volumes:
+        - name: log-volume
+          emptyDir: {}
+      initContainers:
+        - name: log-agent
+          image: busybox
+          command: ['sh', '-c', 'touch /var/log/app/app.log; tail -f /var/log/app/app.log']
+          volumeMounts:
+            - name: log-volume
+              mountPath: /var/log/app
+          restartPolicy: Always # native sidecar
+      containers:
+        - name: app-container
+          image: busybox
+          command:
+            ['sh', '-c', "while true; do echo 'Log entry' >> /var/log/app/app.log; sleep 5; done"]
+          volumeMounts:
+            - name: log-volume
+              mountPath: /var/log/app
+```
+
+> ⚠️ `tail -f`는 파일이 없으면 즉시 죽음 → 사이드카가 메인보다 먼저 떠도 안전하게 `touch`로 파일을 먼저 만들어 둠.
+
+### 3. 적용 & 확인
+
+```bash
+k apply -f logging-deployment.yaml
+
+# 사이드카 로그가 메인이 쓴 내용을 받는지 확인
+kubectl -n logging-ns logs deploy/logging-deployment -c log-agent -f
+# Log entry
+# Log entry
+# ...
+```
+
+### 정리: 멀티컨테이너 로깅 패턴 체크리스트
+
+1. 공유 파일은 `emptyDir` + 두 컨테이너에 같은 `volumeMounts`
+2. 사이드카는 `initContainers` + `restartPolicy: Always` (1.28+ native sidecar)
+3. `tail -f` 사이드카는 파일이 없을 때를 대비해 `touch` 먼저
+4. 검증은 `-c <container>` 로 컨테이너 지정해서 로그 봄
+
+---
+
+## Case 3) Ingress 생성 (ingressClassName 함정)
+
+> A Deployment `webapp-deploy` is running in the `ingress-ns` namespace and is exposed via Service `webapp-svc`. Create an Ingress `webapp-ingress` in the same namespace:
+>
+> - `pathType: Prefix`
+> - Route `/` to backend service on port `80`
+> - Host: `kodekloud-ingress.app`
+>
+> Test: `curl -s http://kodekloud-ingress.app/`
+
+### 1. 처음 만든 manifest (불완전)
+
+```yaml
+# webapp-ingress.yaml
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: webapp-ingress
+  namespace: ingress-ns
+spec:
+  rules:
+    - host: kodekloud-ingress.app
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: webapp-svc
+                port:
+                  number: 80
+```
+
+```bash
+k apply -f webapp-ingress.yaml
+curl -s http://kodekloud-ingress.app/
+# <html><head><title>404 Not Found</title></head>...
+# nginx 404 → Ingress 컨트롤러까지는 도달했지만, 룰이 적용 안 된 상태
+```
+
+### 2. `ingressClassName` 누락이 원인
+
+```bash
+kubectl get ingressclass
+# NAME    CONTROLLER             PARAMETERS   AGE
+# nginx   k8s.io/ingress-nginx   <none>       7m
+```
+
+클러스터에 IngressClass가 default로 마크돼 있지 않으면 Ingress가 어떤 컨트롤러를 쓸지 모름 → `spec.ingressClassName: nginx` 명시.
+
+```yaml
+spec:
+  ingressClassName: nginx # 추가
+  rules:
+    - host: kodekloud-ingress.app
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: webapp-svc
+                port:
+                  number: 80
+```
+
+```bash
+k apply -f webapp-ingress.yaml
+curl -s http://kodekloud-ingress.app/
+# <h1>Welcome to nginx!</h1>  ← 정상
+```
+
+> ⚠️ Ingress 만들었는데 404가 나오면, **컨트롤러까지는 갔지만 룰이 매치 안 됐다**는 신호. 의심 순서: (1) `ingressClassName` 누락, (2) `host`/`path` 오타, (3) backend `service.name` / `port` 오타, (4) Service의 `selector`가 실제 Pod 라벨과 안 맞음.
+
+### 정리: Ingress 404 트러블슈팅 체크리스트
+
+1. `kubectl get ingressclass` 로 컨트롤러 확인 → default 아니면 `spec.ingressClassName` 명시
+2. `kubectl describe ingress <name> -n <ns>` 로 backend가 정상 endpoint를 잡았는지 확인
+3. `kubectl get svc,ep -n <ns>` 로 Service endpoint가 비어있는지 확인 (selector 미스매치)
+4. `curl -H "Host: <host>" http://<ingress-ip>/` 로 호스트 헤더만의 문제인지 분리
+
+---
+
+## Case 4) Deployment imperative 생성 + 이미지 롤링 업데이트 (apply)
+
+> Create a new deployment called `nginx-deploy`, image `nginx:1.16`, 1 replica. Upgrade the deployment to `nginx:1.17` using rolling update.
+>
+> Note: Use the `kubectl apply` command to create or update the deployment.
+
+### 1. dry-run으로 manifest 뽑기
+
+```bash
+kubectl create deployment nginx-deploy \
+  --image=nginx:1.16 --replicas=1 \
+  $do > nginx-deploy.yaml
+```
+
+```yaml
+# nginx-deploy.yaml (핵심 부분만)
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: nginx-deploy
+  template:
+    spec:
+      containers:
+        - image: nginx:1.16
+          name: nginx
+```
+
+```bash
+k apply -f nginx-deploy.yaml
+# deployment.apps/nginx-deploy created
+```
+
+### 2. 이미지 변경 후 다시 apply (롤링 업데이트)
+
+`strategy`를 별도로 지정하지 않으면 Deployment 기본 전략이 `RollingUpdate`라 그냥 manifest의 이미지 태그만 바꿔 다시 apply하면 됨.
+
+```bash
+# nginx-deploy.yaml 의 image: nginx:1.16 → nginx:1.17 로 수정
+k apply -f nginx-deploy.yaml
+# deployment.apps/nginx-deploy configured
+
+k rollout status deploy/nginx-deploy
+# deployment "nginx-deploy" successfully rolled out
+```
+
+> 💡 문제에 "use `kubectl apply`" 라고 명시돼 있으면 `kubectl set image`나 `kubectl edit` 대신 **manifest 수정 후 apply** 흐름을 지켜야 함. 채점 스크립트가 `kubectl.kubernetes.io/last-applied-configuration` annotation을 보고 판단할 수 있음.
+
+---
+
+## Case 5) CSR로 john 인증서 발급 + Role/RoleBinding
+
+> Create a new user called `john`. Grant him access to the cluster using a CSR named `john-developer`. Create a role `developer` granting John permission to `create, list, get, update, delete` pods in the `development` namespace. Private key at `/root/CKA/john.key`, CSR at `/root/CKA/john.csr`.
+>
+> Important: As of k8s 1.19, the CSR object expects a `signerName`.
+
+### 1. CSR 파일을 base64로 인코딩
+
+```bash
+cat /root/CKA/john.csr | base64 -w 0
+# LS0tLS1CRUdJTiBDRVJUSUZJQ0FURSBSRVFVRVNULS0tLS0K... (한 줄로 출력)
+```
+
+> ⚠️ `-w 0` 빼먹으면 줄바꿈이 들어가서 yaml에 그대로 못 붙임. 항상 `-w 0`.
+
+### 2. CertificateSigningRequest 생성 & 승인
+
+```yaml
+# csr.yaml
+apiVersion: certificates.k8s.io/v1
+kind: CertificateSigningRequest
+metadata:
+  name: john-developer
+spec:
+  signerName: kubernetes.io/kube-apiserver-client # 사용자 인증용 시그너
+  request: <위에서 뽑은 base64 문자열>
+  usages:
+    - client auth
+```
+
+```bash
+k apply -f csr.yaml
+
+k get csr
+# NAME             AGE   SIGNERNAME                            CONDITION
+# john-developer   7s    kubernetes.io/kube-apiserver-client   Pending
+
+k certificate approve john-developer
+
+k get csr
+# john-developer   65s   ...   Approved,Issued
+```
+
+### 3. Role 생성 (development 네임스페이스 안에서 pods CRUD)
+
+```yaml
+# developer.yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: developer
+  namespace: development
+rules:
+  - apiGroups: [''] # core API group
+    resources: ['pods']
+    verbs: ['create', 'list', 'get', 'update', 'delete']
+```
+
+```bash
+k apply -f developer.yaml
+```
+
+### 4. RoleBinding으로 john에 Role 연결
+
+```yaml
+# developer-binding.yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: developer-role-binding
+  namespace: development
+subjects:
+  - kind: User
+    name: john
+    apiGroup: rbac.authorization.k8s.io
+roleRef:
+  kind: Role
+  name: developer
+  apiGroup: rbac.authorization.k8s.io
+```
+
+```bash
+k apply -f developer-binding.yaml
+```
+
+### 5. `auth can-i` 로 권한 검증
+
+```bash
+# 허용돼야 하는 것들 (전부 yes)
+kubectl auth can-i create pods --as=john -n development   # yes
+kubectl auth can-i list   pods --as=john -n development   # yes
+kubectl auth can-i get    pods --as=john -n development   # yes
+kubectl auth can-i update pods --as=john -n development   # yes
+kubectl auth can-i delete pods --as=john -n development   # yes
+
+# 거부돼야 하는 것들 (전부 no)
+kubectl auth can-i create pods         --as=john -n default       # no  (네임스페이스 다름)
+kubectl auth can-i list   deployments  --as=john -n development   # no  (리소스 다름)
+```
+
+### 정리: CSR 기반 사용자 추가 체크리스트
+
+1. `cat <csr> | base64 -w 0` 으로 인코딩 (줄바꿈 금지)
+2. CSR yaml에 `signerName: kubernetes.io/kube-apiserver-client` 와 `usages: ["client auth"]` 명시
+3. `kubectl certificate approve <name>` 으로 승인 → `Approved,Issued`
+4. Role / RoleBinding은 **같은 네임스페이스** (Role은 네임스페이스 스코프)
+5. RoleBinding `subjects.name`은 CSR의 CN(`CN=john`)과 정확히 일치해야 함
+6. 마지막에 꼭 `kubectl auth can-i ... --as=<user>` 로 양/음성 케이스 모두 검증
+
+---
+
+## Case 6) ClusterIP 서비스 + Pod IP DNS 조회 (busybox)
+
+> Create an nginx pod `nginx-resolver` and expose it internally using a ClusterIP service `nginx-resolver-service`. From within the cluster verify:
+>
+> - DNS resolution of the service name
+> - Network reachability of the pod using its IP address
+>
+> Use `busybox:1.28` to perform the lookups.
+> Save service DNS lookup → `/root/CKA/nginx.svc`, pod IP lookup → `/root/CKA/nginx.pod`.
+
+### 1. Pod + ClusterIP 서비스 imperative 생성
+
+```bash
+kubectl run nginx-resolver --image=nginx
+# pod/nginx-resolver created
+
+k expose pod nginx-resolver \
+  --name=nginx-resolver-service \
+  --port=80 --target-port=80
+# service/nginx-resolver-service exposed
+```
+
+### 2. 서비스명 DNS 조회 → `nginx.svc`
+
+busybox 임시 Pod을 띄워서 nslookup만 실행하고 자동 삭제 (`--rm -it --restart=Never`).
+
+```bash
+k run busybox --image=busybox:1.28 --rm -it --restart=Never \
+  -- nslookup nginx-resolver-service > /root/CKA/nginx.svc
+
+cat /root/CKA/nginx.svc
+# Server:    172.20.0.10
+# Address 1: 172.20.0.10 kube-dns.kube-system.svc.cluster.local
+#
+# Name:      nginx-resolver-service
+# Address 1: 172.20.95.147 nginx-resolver-service.default.svc.cluster.local
+```
+
+### 3. Pod IP DNS 조회 → `nginx.pod`
+
+Pod IP를 직접 nslookup 하려면 **`172.17.1.14` 가 아니라 `172-17-1-14.<ns>.pod.cluster.local`** 형태로 변환해야 함 (점을 하이픈으로).
+
+```bash
+k get pod -o wide | grep nginx-resolver
+# nginx-resolver   1/1   Running   0   14m   172.17.1.14   node01   <none>   <none>
+
+k run busybox --image=busybox:1.28 --rm -it --restart=Never \
+  -- nslookup 172-17-1-14.default.pod.cluster.local > /root/CKA/nginx.pod
+
+cat /root/CKA/nginx.pod
+# Name:      172-17-1-14.default.pod.cluster.local
+# Address 1: 172.17.1.14 172-17-1-14.nginx-resolver-service.default.svc.cluster.local
+```
+
+> 💡 Pod의 DNS 이름 규칙: `<pod-ip-with-dashes>.<namespace>.pod.cluster.local`. IP의 `.`을 `-`로만 바꾸면 됨.
+> ⚠️ `nslookup <pod-ip>` (숫자 IP) 는 PTR 역방향 조회를 시도하다 실패하기 쉽고, 채점에서 요구하는 출력 포맷과도 다름. 반드시 **하이픈 형태 DNS 이름**으로 조회.
+
+### 정리: 클러스터 내부 DNS 조회 체크리스트
+
+1. 임시 검증 Pod은 `--rm -it --restart=Never` 로 자동 정리
+2. busybox는 **1.28** 버전을 써야 `nslookup`이 정상 동작 (최신 버전엔 빠져 있음)
+3. Service DNS: `<svc>.<ns>.svc.cluster.local`
+4. Pod DNS: `<pod-ip-with-dashes>.<ns>.pod.cluster.local`
+5. 결과 저장은 `> /path` 리다이렉트로 — 컨테이너 stdout이 그대로 파일에 들어감
+
+---
+
+## Case 7) node01에 Static Pod 생성
+
+> Create a static pod on `node01` called `nginx-critical` with the image `nginx`. Make sure that it is recreated/restarted automatically in case of a failure.
+>
+> For example, use `/etc/kubernetes/manifests` as the static Pod path.
+
+### 1. node01로 SSH 접속 후 manifest 디렉토리로 이동
+
+Static Pod의 manifest 파일은 kubelet이 감시하는 디렉토리에 두면 됨 (보통 `/etc/kubernetes/manifests`).
+
+```bash
+ssh node01
+cd /etc/kubernetes/manifests/
+```
+
+### ⚠️ `kubectl run --dry-run` 으로 yaml 뽑는 시도가 실패
+
+node01에는 보통 kubeconfig가 없어서 `kubectl run`이 동작하지 않음.
+
+```bash
+kubectl run nginx-critical --image=nginx --dry-run=client -o yaml > nginx-critical.yaml
+# Error from server (NotFound): the server could not find the requested resource
+```
+
+> ⚠️ 워커 노드(`node01`)에는 API 서버에 접근할 kubeconfig가 없을 수 있음 → `kubectl` 명령은 control plane에서 쓰고, **노드 위에서는 manifest 파일을 직접 작성**하는 게 안전.
+
+### 2. manifest 파일 직접 작성
+
+```bash
+cat <<EOF > /etc/kubernetes/manifests/nginx-critical.yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: nginx-critical
+spec:
+  containers:
+    - name: web
+      image: nginx
+      ports:
+        - name: web
+          containerPort: 80
+          protocol: TCP
+EOF
+```
+
+파일을 두기만 하면 kubelet이 알아서 감지해서 Pod을 띄움 — `kubectl apply` 같은 거 따로 안 해도 됨.
+
+### 3. control plane에서 확인
+
+```bash
+k get pod -o wide
+# NAME                    READY   STATUS    RESTARTS   AGE   IP            NODE
+# nginx-critical-node01   1/1     Running   0          83s   172.17.1.11   node01
+```
+
+> 💡 Static Pod은 API에 등록될 때 이름 뒤에 노드 이름이 자동으로 붙음 (`nginx-critical` → `nginx-critical-node01`). 시험에서 헷갈리지 말 것.
+
+### 정리: Static Pod 체크리스트
+
+1. 작업은 **노드 위에서** — `ssh node01` 후 `/etc/kubernetes/manifests/`
+2. manifest 파일을 그 경로에 두기만 하면 kubelet이 띄움
+3. `kubectl run --dry-run` 으로 베이스를 못 받는 환경이면 처음부터 직접 작성
+4. "자동 재시작" 요구는 static Pod 자체 특성으로 만족 — kubelet이 죽으면 다시 띄움
+5. API 상으로 보면 이름에 `-<node-name>` suffix가 붙는 점 인지
+
+---
+
+## Case 8) HPA — 메모리 기반 (template 수정)
+
+> Create a Horizontal Pod Autoscaler with name `backend-hpa` for the deployment named `backend-deployment` in the `backend` namespace with the `webapp-hpa.yaml` file located under the root folder.
+>
+> Ensure that the HPA scales the deployment based on memory utilization, maintaining an average memory usage of 65% across all pods.
+>
+> Configure the HPA with a minimum of 3 replicas and a maximum of 15.
+
+### 1. 대상 Deployment 확인
+
+```bash
+k -n backend get deployments.apps
+# NAME                 READY   UP-TO-DATE   AVAILABLE   AGE
+# backend-deployment   3/3     3            3           77s
+```
+
+### 2. 제공된 template 상태
+
+`webapp-hpa.yaml` (초기):
+
+```yaml
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: webapp-hpa
+  namespace: backend
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: kkapp-deploy
+  minReplicas: 3
+  maxReplicas: 15
+```
+
+`name`, `scaleTargetRef.name`이 잘못 들어가 있고 `metrics`가 빠져 있음.
+
+### 3. 최종 manifest
+
+```yaml
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: backend-hpa
+  namespace: backend
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: backend-deployment
+  minReplicas: 3
+  maxReplicas: 15
+  metrics:
+    - type: Resource
+      resource:
+        name: memory
+        target:
+          type: Utilization
+          averageUtilization: 65
+```
+
+```bash
+k apply -f webapp-hpa.yaml
+```
+
+### 4. 결과 확인
+
+```bash
+k describe hpa backend-hpa -n backend
+# Reference:        Deployment/backend-deployment
+# Metrics:          resource memory on pods (as a percentage of request):  <unknown> / 65%
+# Min replicas:     3
+# Max replicas:     15
+```
+
+> ⚠️ `<unknown>` + `FailedGetResourceMetric` 이벤트가 뜰 수 있음 — 클러스터에 metrics-server가 없으면 실제 측정값을 못 가져옴. HPA 스펙 자체는 정답이므로 시험에선 OK.
+
+> 💡 HPA 메모리 기반 포인트: `metrics[0].resource.name: memory`, `target.type: Utilization`, `averageUtilization: 65`. CPU는 `name: cpu`로만 바꾸면 동일 (Case 9 in Mock Test 1 참고).
+
+---
+
+## Case 9) Gateway에 HTTPS listener 추가
+
+> Modify the existing `web-gateway` on `cka5673` namespace to handle HTTPS traffic on port 443 for `kodekloud.com`, using a TLS certificate stored in a secret named `kodekloud-tls`.
+
+### 1. 현재 Gateway 상태 확인
+
+```bash
+k get gateway -n cka5673
+# NAME          CLASS       ADDRESS   PROGRAMMED   AGE
+# web-gateway   kodekloud             Unknown      87s
+```
+
+기존 listener는 HTTP 80 하나만 있음.
+
+### 2. `k edit`으로 HTTPS listener 추가
+
+```bash
+k edit gateway web-gateway -n cka5673
+```
+
+`spec.listeners`에 HTTPS 항목을 추가:
+
+```yaml
+spec:
+  gatewayClassName: kodekloud
+  listeners:
+    - name: http
+      port: 80
+      protocol: HTTP
+      hostname: kodekloud.com
+      allowedRoutes:
+        namespaces:
+          from: Same
+    - name: https
+      port: 443
+      protocol: HTTPS
+      hostname: kodekloud.com
+      tls:
+        certificateRefs:
+          - name: kodekloud-tls
+      allowedRoutes:
+        namespaces:
+          from: Same
+```
+
+### 3. 확인
+
+```bash
+k get gateway web-gateway -n cka5673 -o yaml
+# spec.listeners[1]:
+#   name: https
+#   port: 443
+#   protocol: HTTPS
+#   tls:
+#     certificateRefs:
+#       - group: ""
+#         kind: Secret
+#         name: kodekloud-tls
+#     mode: Terminate
+```
+
+저장 후 API 서버가 `tls.mode: Terminate`, `certificateRefs[].kind: Secret`을 기본값으로 채워줌.
+
+> 💡 Gateway HTTPS listener의 필수 4종:
+>
+> 1. `protocol: HTTPS`
+> 2. `port: 443`
+> 3. `hostname` (TLS SNI 매칭)
+> 4. `tls.certificateRefs[].name` (Secret 참조)
+
+> ⚠️ HTTPS listener에서 `hostname`을 안 적으면 SNI 매칭이 안 돼서 TLS 핸드셰이크가 깨질 수 있음 — 문제에 호스트가 명시되면 반드시 같이 적기.
+
+---
+
+## Case 10) 취약 이미지 helm release 찾아서 삭제
+
+> On the cluster, the team has installed multiple helm charts on a different namespace. By mistake, those deployed resources include one of the vulnerable images called `kodekloud/webapp-color:v1`. Find out the release name and uninstall it.
+
+### 1. 해당 이미지를 쓰는 Pod 검색
+
+전체 네임스페이스 Pod의 컨테이너 이미지를 custom-columns로 출력하고 grep:
+
+```bash
+k get pods -A -o custom-columns=NAME:.metadata.name,IMAGE:.spec.containers[].image | grep -i kodekloud/webapp-color:v1
+# atlanta-page-apd-655896796-4w89n   kodekloud/webapp-color:v1
+# atlanta-page-apd-655896796-bsjfh   kodekloud/webapp-color:v1
+# ...
+```
+
+Pod 이름 prefix가 `atlanta-page-apd-...` → helm release 이름과 매칭됨.
+
+### 2. helm release 목록과 대조
+
+```bash
+helm list -A
+# NAME                 NAMESPACE          REVISION   STATUS     CHART
+# atlanta-page-apd     atlanta-page-04    1          deployed   atlanta-page-apd-0.1.0
+# digi-locker-apd      digi-locker-02     1          deployed   digi-locker-apd-0.1.0
+# security-alpha-apd   security-alpha-01  1          deployed   security-alpha-apd-0.1.0
+# web-dashboard-apd    web-dashboard-03   1          deployed   web-dashboard-apd-0.1.0
+```
+
+→ `atlanta-page-apd` 가 범인.
+
+### 3. uninstall
+
+```bash
+helm uninstall atlanta-page-apd -n atlanta-page-04
+# release "atlanta-page-apd" uninstalled
+```
+
+### 4. 검증
+
+```bash
+k get pods -A -o custom-columns=NAME:.metadata.name,IMAGE:.spec.containers[].image | grep -i kodekloud/webapp-color:v1
+# (출력 없음)
+```
+
+> 💡 `-o custom-columns=NAME:...,IMAGE:.spec.containers[].image` 는 시험에서 자주 쓰는 패턴. 컨테이너가 여러 개인 Pod은 첫 번째만 잡히니 정밀하게 보려면 `.spec.containers[*].image`.
+
+> 💡 helm release는 **namespace 단위로 관리**됨 → `helm uninstall <release>` 시 `-n <ns>` 반드시 같이 (또는 `helm list -A`로 namespace 먼저 확인).
+
+---
+
+## Case 11) NetworkPolicy — 가장 제한적인 정책 고르기
+
+> You are requested to create a NetworkPolicy to allow traffic from frontend apps located in the `frontend` namespace, to backend apps located in the `backend` namespace, but not from the databases in the `databases` namespace. There are three policies available in the `/root` folder. Apply the **most restrictive** policy from the provided YAML files. Do not delete any existing policies.
+
+### 1. 제공된 3개 정책 비교
+
+| 파일             | from selector                                                       | 의미                                     | 적합?                         |
+| ---------------- | ------------------------------------------------------------------- | ---------------------------------------- | ----------------------------- |
+| `net-pol-1.yaml` | `namespaceSelector matchLabels: access=allowed`                     | `access=allowed` 라벨 붙은 모든 ns 허용  | ❌ 너무 일반적·불명확         |
+| `net-pol-2.yaml` | `namespaceSelector: name=frontend` **+** `name=databases` (두 항목) | frontend **와** databases 양쪽 모두 허용 | ❌ databases가 들어가면 안 됨 |
+| `net-pol-3.yaml` | `namespaceSelector: name=frontend` 만                               | frontend만 허용, databases·기타 ns 차단  | ✅ 정답                       |
+
+`net-pol-3.yaml`:
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: net-policy-3
+  namespace: backend
+spec:
+  podSelector: {}
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              name: frontend
+      ports:
+        - protocol: TCP
+          port: 80
+```
+
+### 2. 적용
+
+```bash
+k apply -f net-pol-3.yaml
+# networkpolicy.networking.k8s.io/net-policy-3 created
+```
+
+### 정리: NetworkPolicy 고를 때 체크리스트
+
+1. `from:` 배열의 각 항목은 **OR** — 항목이 늘어날수록 허용 범위가 넓어짐 (더 느슨해짐)
+2. 한 항목 안의 `namespaceSelector` + `podSelector` 조합은 **AND** — 더 좁아짐
+3. 문제에서 "허용할 출발지" 하나만 명시되면 → 그 ns만 selector에 두는 정책이 가장 제한적
+4. `access=allowed` 같은 메타 라벨에 의존하면 다른 ns가 같은 라벨을 달기만 해도 통과돼서 위험
+5. 기존 정책 건드리지 말라는 지시 → `k apply -f` 로 새 정책 추가만, `delete` 금지
