@@ -856,3 +856,687 @@ k apply -f sega.yaml
 ```
 
 > 💡 imperative 명령으로는 한 컨테이너 Pod 만 만들 수 있음 — 멀티 컨테이너는 항상 `--dry-run=client -o yaml` 로 골격 뽑고 두 번째 컨테이너 손으로 추가하는 패턴.
+
+# Lightning Lab 2
+
+## Case 1) Readiness 실패 Pod 찾아서 고치고 livenessProbe 추가
+
+> 클러스터의 여러 네임스페이스에 Pod 들이 떠 있다. **Not Ready** 상태인 Pod 을 찾아 트러블슈팅. 그 다음 같은 Pod 에 `ls /var/www/html/file_check` 가 실패하면 컨테이너를 재시작하도록 체크를 추가. delay 10s, period 60s. Pod 삭제 후 재생성 가능, probe 관련 warning 은 무시.
+
+### 1. Not Ready Pod 찾기
+
+```bash
+k get pods -A
+# dev1401   nginx1401   0/1   Running   ...   ← 얘만 READY 0/1
+```
+
+### 2. 원인 파악 — describe 이벤트 확인
+
+```bash
+k describe -n dev1401 pod nginx1401
+# Warning  Unhealthy ... Readiness probe failed:
+#   Get "http://172.17.1.2:8080/": dial tcp 172.17.1.2:8080: connect: connection refused
+```
+
+컨테이너는 `containerPort: 9080` 으로 떠 있는데 readinessProbe 가 `8080` 을 찌르고 있어서 연결 거부.
+
+```yaml
+ports:
+  - containerPort: 9080
+    protocol: TCP
+readinessProbe:
+  httpGet:
+    path: /
+    port: 8080 # ← 잘못된 포트
+```
+
+### 3. yaml 수정 — 포트 교정 + livenessProbe 추가
+
+```bash
+k get -n dev1401 pod nginx1401 -o yaml > dev.yaml
+vim dev.yaml
+```
+
+```yaml
+ports:
+  - containerPort: 9080
+    protocol: TCP
+readinessProbe:
+  failureThreshold: 3
+  httpGet:
+    path: /
+    port: 9080 # 9080 으로 수정
+    scheme: HTTP
+  periodSeconds: 10
+  successThreshold: 1
+  timeoutSeconds: 1
+livenessProbe:
+  exec:
+    command:
+      - ls
+      - /var/www/html/file_check
+  initialDelaySeconds: 10
+  periodSeconds: 60
+```
+
+### 4. 삭제 후 재적용
+
+```bash
+k delete -n dev1401 pod nginx1401
+k apply -f dev.yaml
+k get -n dev1401 pod nginx1401
+# nginx1401   1/1   Running   0   8s
+```
+
+> 💡 `exec` 타입 probe 는 컨테이너 안에서 명령 실행 결과(exit code)로 판정 — `ls <file>` 실패 → liveness 실패 → 재시작.
+
+---
+
+## Case 2) CronJob — backoffLimit + activeDeadlineSeconds
+
+> `dice` 라는 CronJob 을 매 1분마다 실행. Pod 템플릿은 `/root/throw-a-dice`. 이미지는 1~6 중 랜덤 값 반환하는 `throw-dice`(=`kodekloud/throw-dice`). non-parallel, 한 번만 완료, `backoffLimit: 25`. 20초 안에 끝내지 못하면 fail 후 종료.
+
+### 1. 제공된 Pod 템플릿 확인
+
+```bash
+cat /root/throw-a-dice/throw-a-dice.yaml
+# apiVersion: v1
+# kind: Pod
+# spec:
+#   containers:
+#     - image: kodekloud/throw-dice
+#       name: throw-dice
+#   restartPolicy: Never
+```
+
+### 2. CronJob 매니페스트 작성
+
+```yaml
+# cj.yaml
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: dice
+spec:
+  schedule: '* * * * *'
+  jobTemplate:
+    spec:
+      parallelism: 1
+      completions: 1
+      backoffLimit: 25
+      activeDeadlineSeconds: 20
+      template:
+        spec:
+          containers:
+            - image: kodekloud/throw-dice
+              name: throw-dice
+          restartPolicy: Never
+```
+
+```bash
+k apply -f cj.yaml
+```
+
+> 💡 요구사항 → 필드 매핑
+>
+> - non-parallel + 한 번만 완료 → `parallelism: 1`, `completions: 1`
+> - 25번까지 재시도 → `backoffLimit: 25`
+> - 20초 안에 안 끝나면 fail → `activeDeadlineSeconds: 20` (Job 레벨)
+> - 매 1분 → `schedule: "* * * * *"`
+
+---
+
+## Case 3) 특정 노드에 Pod 스케줄 + Secret 볼륨 read-only 마운트
+
+> `dev2406` 네임스페이스에 `my-busybox` Pod 생성. 컨테이너 이름 `secret`, 이미지 `busybox`, 3600초 sleep. `dotfile-secret` 시크릿을 `secret-volume` 이름으로 `/etc/secret-volume` 에 **read-only** 마운트. Pod 은 반드시 `controlplane` 노드에 스케줄.
+
+### 1. controlplane 노드 taint 확인
+
+```bash
+k describe nodes controlplane
+# Taints: <none>          ← taint 없으므로 nodeSelector 만으로 가능
+# Labels: kubernetes.io/hostname=controlplane
+```
+
+> 💡 taint 가 있었으면 `tolerations` 도 같이 박아야 함. 여기선 없으니 `nodeSelector` 만으로 충분.
+
+### 2. dry-run 으로 골격 뽑기
+
+```bash
+k run my-busybox -n dev2406 --image=busybox \
+  --dry-run=client -o yaml > mb.yaml
+```
+
+### 3. yaml 수정 — nodeSelector, secret volume, 컨테이너 이름/커맨드
+
+```yaml
+# mb.yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  labels:
+    run: my-busybox
+  name: my-busybox
+  namespace: dev2406
+spec:
+  nodeSelector:
+    kubernetes.io/hostname: controlplane
+  volumes:
+    - name: secret-volume
+      secret:
+        secretName: dotfile-secret
+  containers:
+    - image: busybox
+      name: secret
+      command:
+        - sleep
+        - '3600'
+      volumeMounts:
+        - mountPath: /etc/secret-volume
+          name: secret-volume
+          readOnly: true
+  restartPolicy: Always
+```
+
+```bash
+k apply -f mb.yaml
+```
+
+> 💡 `k run` 의 `--command -- sleep 3600` 옵션으로도 sleep 을 줄 수 있지만, 어차피 yaml 손볼 거라 `command:` 블록을 직접 박는 게 깔끔.
+
+---
+
+## Case 4) Ingress 가상 호스트 라우팅 + rewrite-target
+
+> 하나의 Ingress `ingress-vh-routing` 으로 두 호스트 라우팅.
+>
+> - `http://watch.ecom-store.com:30093/video` → `video-service`
+> - `http://apparels.ecom-store.com:30093/wear` → `apparels-service`
+>
+> 백엔드 경로 재작성을 위해 `nginx.ingress.kubernetes.io/rewrite-target: /` 어노테이션 필수. 30093 은 Ingress Controller 포트.
+
+### 1. 백엔드 서비스 / IngressClass 확인
+
+```bash
+k get svc
+# apparels-service   ClusterIP   ...   8080/TCP
+# video-service      ClusterIP   ...   8080/TCP
+
+k get ingressclasses.networking.k8s.io
+# NAME    CONTROLLER             AGE
+# nginx   k8s.io/ingress-nginx   31m
+```
+
+### 2. Ingress 매니페스트
+
+```yaml
+# ig.yaml
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: ingress-vh-routing
+  annotations:
+    nginx.ingress.kubernetes.io/rewrite-target: /
+spec:
+  ingressClassName: nginx
+  rules:
+    - host: watch.ecom-store.com
+      http:
+        paths:
+          - path: /video
+            pathType: Prefix
+            backend:
+              service:
+                name: video-service
+                port:
+                  number: 8080
+    - host: apparels.ecom-store.com
+      http:
+        paths:
+          - path: /wear
+            pathType: Prefix
+            backend:
+              service:
+                name: apparels-service
+                port:
+                  number: 8080
+```
+
+```bash
+k apply -f ig.yaml
+```
+
+> 💡 `rewrite-target: /` 가 있어야 `/video/foo` 요청이 백엔드에는 `/foo` 로 들어감. 안 박으면 백엔드가 `/video/foo` 그대로 받음.
+> ⚠️ Service `port.number` 는 ClusterIP Service 의 `port` 값(8080), Pod 의 containerPort 가 아님.
+
+---
+
+## Case 5) 특정 컨테이너 로그에서 warning 만 파일로
+
+> `default` 네임스페이스의 Pod `dev-pod-dind-878516` 에서 컨테이너 `log-x` 의 로그를 보고, warning 만 controlplane 의 `/opt/dind-878516_logs.txt` 로 redirect.
+
+```bash
+k logs dev-pod-dind-878516 -c log-x | grep -i warning > /opt/dind-878516_logs.txt
+```
+
+> 💡 멀티 컨테이너 Pod 은 `-c <컨테이너이름>` 으로 컨테이너 지정 안 하면 에러. `grep -i` 로 대소문자 무시(`WARNING` / `Warning` / `warning` 다 잡힘).
+
+# Mock Test 2
+
+## Case 1) Deployment 생성 + NodePort 서비스로 expose
+
+> Create a deployment called `my-webapp` with image: `nginx`, label `tier:frontend` and 2 replicas. Expose the deployment as a NodePort service with name `front-end-service`, port: 80 and NodePort: 30083.
+
+### 1. Deployment 베이스 yaml 뽑고 라벨 추가
+
+`kubectl create deployment` 에는 `--labels` 플래그가 없음 → dry-run 으로 뽑아서 `metadata.labels` 직접 추가.
+
+```bash
+kubectl create deployment my-webapp \
+  --image=nginx \
+  --replicas=2 \
+  --dry-run=client -o yaml > deploy.yaml
+```
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  labels:
+    tier: frontend # 추가
+  name: my-webapp
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: my-webapp
+  template:
+    metadata:
+      labels:
+        app: my-webapp
+    spec:
+      containers:
+        - name: nginx
+          image: nginx
+```
+
+### 2. NodePort Service — nodePort 직접 지정
+
+`k expose` 는 `nodePort` 를 직접 못 박음 → dry-run 으로 base yaml 받고 `nodePort: 30083` 박기.
+
+```bash
+kubectl expose deployment my-webapp \
+  --port=80 \
+  --type=NodePort \
+  --name=front-end-service \
+  --dry-run=client -o yaml > svc.yaml
+```
+
+```yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: front-end-service
+spec:
+  type: NodePort
+  selector:
+    app: my-webapp
+  ports:
+    - port: 80
+      targetPort: 80
+      nodePort: 30083
+```
+
+```bash
+k apply -f deploy.yaml -f svc.yaml
+```
+
+```bash
+k get svc front-end-service
+# NAME                TYPE       CLUSTER-IP     PORT(S)        AGE
+# front-end-service   NodePort   172.20.56.21   80:30083/TCP   59s
+```
+
+> 💡 `k create deployment` 와 `k expose` 모두 imperative 로 안 풀리는 옵션(`metadata.labels`, `nodePort`)이 있으면 dry-run + yaml 수정 패턴이 가장 안전.
+
+---
+
+## Case 2) Node Taint + Pod Toleration
+
+> Add a taint to `node01` — `key: app_type, value: alpha, effect: NoSchedule`. Create a pod called `alpha` (image `redis`) with a toleration for that taint.
+
+### 1. Taint 부여
+
+```bash
+kubectl taint nodes node01 app_type=alpha:NoSchedule
+# node/node01 tainted
+```
+
+### 2. Pod 에 toleration
+
+```yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: alpha
+spec:
+  containers:
+    - name: redis
+      image: redis
+  tolerations:
+    - key: app_type
+      operator: Equal
+      value: alpha
+      effect: NoSchedule
+```
+
+```bash
+k apply -f alpha.yaml
+# pod/alpha created
+```
+
+> 💡 toleration 의 `operator: Equal` 은 `value` 까지 일치해야 함. `operator: Exists` 는 key 만 있으면 매칭 → 이 경우 `value` 필드는 빼야 함.
+> ⚠️ toleration 만 있다고 _반드시_ 그 노드에 스케줄되지는 않음 — taint 의 `NoSchedule` 을 _허용_ 해주는 것뿐, 다른 untaint 노드로도 갈 수 있음. 특정 노드 강제하려면 `nodeSelector` / `nodeAffinity` 같이 줘야 함.
+
+---
+
+## Case 3) NodeAffinity 로 controlplane 에만 Pod 배치
+
+> Apply label `app_type=beta` to node `controlplane`. Create a deployment `beta-apps` (image `nginx`, 3 replicas) with `NodeAffinity` (`requiredDuringSchedulingIgnoredDuringExecution`) so all pods land on `controlplane` only.
+
+### 1. Node 라벨링
+
+```bash
+kubectl label nodes controlplane app_type=beta
+# node/controlplane labeled
+```
+
+### 2. controlplane taint 확인
+
+```bash
+k describe node controlplane | grep -i taint
+# Taints: <none>
+```
+
+> 💡 보통 controlplane 에는 `node-role.kubernetes.io/control-plane:NoSchedule` taint 가 박혀 있어 일반 Pod 가 못 들어감. 이 환경은 taint 가 없어서 toleration 없이 NodeAffinity 만으로 충분.
+
+### 3. Deployment with NodeAffinity
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: beta-apps
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: beta-apps
+  template:
+    metadata:
+      labels:
+        app: beta-apps
+    spec:
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: app_type
+                    operator: In
+                    values:
+                      - beta
+      containers:
+        - name: nginx
+          image: nginx
+```
+
+```bash
+k apply -f beta.yaml
+k get pod -l app=beta-apps -o wide
+# NAME                        READY   STATUS    NODE
+# beta-apps-84b9b6cff-6jdts   1/1     Running   controlplane
+# beta-apps-84b9b6cff-6xmhd   1/1     Running   controlplane
+# beta-apps-84b9b6cff-77rzh   1/1     Running   controlplane
+```
+
+---
+
+## Case 4) Ingress — host + path 라우팅 + rewrite-target
+
+> Create an Ingress for service `my-video-service` available at `http://ckad-mock-exam-solution.com:30093/video`.
+>
+> - annotation: `nginx.ingress.kubernetes.io/rewrite-target: /`
+> - host: `ckad-mock-exam-solution.com`
+> - path: `/video`
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: my-video-service
+  annotations:
+    nginx.ingress.kubernetes.io/rewrite-target: /
+spec:
+  ingressClassName: nginx
+  rules:
+    - host: ckad-mock-exam-solution.com
+      http:
+        paths:
+          - path: /video
+            pathType: Prefix
+            backend:
+              service:
+                name: my-video-service
+                port:
+                  number: 8080
+```
+
+```bash
+k apply -f ig.yaml
+```
+
+검증:
+
+```bash
+curl http://ckad-mock-exam-solution.com:30093/video
+# <!doctype html>
+# <title>Hello from Flask</title>
+# ...
+```
+
+> 💡 `rewrite-target: /` 가 있어야 `/video` 요청이 백엔드에는 `/` 로 들어감 — 없으면 백엔드가 `/video` 그대로 받아서 404 나기 쉬움.
+> ⚠️ `service.port.number` 는 _Service_ 의 `port` 값(8080). 백엔드 Pod 의 containerPort 가 아님 — Ingress 는 Service 를 거치니까.
+
+---
+
+## Case 5) 기존 Pod 에 ReadinessProbe 추가
+
+> Pod `pod-with-rprobe` 에 `httpGet` ReadinessProbe (`path: /ready`, `port: 8080`) 를 추가.
+
+### 1. 현재 spec 추출 + 런타임 필드 정리
+
+```bash
+k get pod pod-with-rprobe -o yaml > pr.yaml
+# 에디터로 status, uid, resourceVersion, creationTimestamp, nodeName,
+# serviceAccount 자동주입분, volumes(kube-api-access-*),
+# volumeMounts(serviceaccount), tolerations(자동 추가분) 등 정리
+```
+
+### 2. container 에 readinessProbe 추가
+
+```yaml
+spec:
+  containers:
+    - name: pod-with-rprobe
+      image: kodekloud/webapp-delayed-start
+      env:
+        - name: APP_START_DELAY
+          value: '180'
+      ports:
+        - containerPort: 8080
+          protocol: TCP
+      readinessProbe:
+        httpGet:
+          path: /ready
+          port: 8080
+```
+
+### 3. 재배포
+
+```bash
+k delete pod pod-with-rprobe
+k apply -f pr.yaml
+```
+
+> ⚠️ Pod 은 probe 필드를 in-place 로 수정 불가 → 삭제 후 재생성. (Deployment 라면 `k edit` 으로 바로 가능)
+> 💡 `APP_START_DELAY=180` 때문에 앱이 뜨는 데 3분 걸림. `initialDelaySeconds` 안 줘도 readinessProbe 가 알아서 fail/retry 하다 ready 되면 success 처리 — 그래서 문제에서 별도 delay 요구 안 함.
+
+---
+
+## Case 6) LivenessProbe — exec command
+
+> Create a pod `nginx1401` (image `nginx`) with a `livenessProbe` that restarts the container if `ls /var/www/html/probe` fails. `initialDelaySeconds: 10`, `periodSeconds: 60`. Ignore the warnings from the probe.
+
+```bash
+k run nginx1401 --image=nginx --dry-run=client -o yaml > nginx.yaml
+```
+
+```yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: nginx1401
+spec:
+  containers:
+    - name: nginx1401
+      image: nginx
+      livenessProbe:
+        exec:
+          command:
+            - ls
+            - /var/www/html/probe
+        initialDelaySeconds: 10
+        periodSeconds: 60
+```
+
+```bash
+k apply -f nginx.yaml
+```
+
+> 💡 `exec` probe 는 컨테이너 안에서 명령을 실행해 exit code 0 이면 success. nginx 이미지에 `/var/www/html/probe` 가 없으므로 항상 fail → 재시작 반복. 문제에서 "Ignore the warnings from the probe" 라 한 이유.
+
+---
+
+## Case 7) Job — completions + backoffLimit
+
+> Create a job called `whalesay` with image `busybox` and command `echo "cowsay I am going to ace CKAD!"`. `completions: 10`, `backoffLimit: 6`, `restartPolicy: Never`.
+
+```yaml
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: whalesay
+spec:
+  completions: 10
+  backoffLimit: 6
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: busybox
+          image: busybox
+          command:
+            - sh
+          args:
+            - -c
+            - echo "cowsay I am going to ace CKAD!"
+```
+
+```bash
+k apply -f wj.yaml
+k get job whalesay
+# NAME       COMPLETIONS   DURATION   AGE
+# whalesay   10/10         15s        20s
+```
+
+> 💡 `completions: N` 은 Pod 가 N번 *성공*해야 Job 완료. `parallelism` 은 동시에 몇 개를 굴릴지(기본 1). `backoffLimit` 은 fail Pod 누적 재시도 한도.
+> ⚠️ Job 의 `restartPolicy` 는 `Never` 또는 `OnFailure` 만 허용. `Always` 는 invalid.
+
+---
+
+## Case 8) 멀티 컨테이너 Pod — 컨테이너별 env
+
+> Create pod `multi-pod` with two containers:
+>
+> - `jupiter` (nginx) — env `type=planet`
+> - `europa` (busybox, `command: sleep 4800`) — env `type=moon`
+
+```yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: multi-pod
+spec:
+  containers:
+    - name: jupiter
+      image: nginx
+      env:
+        - name: type
+          value: planet
+    - name: europa
+      image: busybox
+      command:
+        - sleep
+        - '4800'
+      env:
+        - name: type
+          value: moon
+```
+
+```bash
+k apply -f mp.yaml
+```
+
+검증:
+
+```bash
+k exec multi-pod -c jupiter -- printenv type
+# planet
+k exec multi-pod -c europa -- printenv type
+# moon
+```
+
+> 💡 `env` 는 *컨테이너별*로 따로 정의. Pod-level 이 아님 — 같은 키도 컨테이너마다 다른 값을 줄 수 있음.
+> ⚠️ busybox 는 default command 가 없어서 `command: [sleep, "4800"]` 같은 게 없으면 즉시 종료(CrashLoopBackOff) — 멀티 컨테이너 Pod 에서 한 컨테이너가 죽으면 Pod 전체가 Not Ready 됨.
+
+---
+
+## Case 9) PersistentVolume — hostPath + Retain
+
+> Create a PersistentVolume `custom-volume`: `size: 50MiB`, `reclaimPolicy: Retain`, `accessModes: ReadWriteMany`, `hostPath: /opt/data`.
+
+```yaml
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: custom-volume
+spec:
+  capacity:
+    storage: 50Mi
+  accessModes:
+    - ReadWriteMany
+  persistentVolumeReclaimPolicy: Retain
+  hostPath:
+    path: /opt/data
+```
+
+```bash
+k apply -f pv.yaml
+k get pv custom-volume
+# NAME            CAPACITY   ACCESS MODES   RECLAIM POLICY   STATUS
+# custom-volume   50Mi       RWX            Retain           Available
+```
+
+> 💡 수동 생성 PV 의 `persistentVolumeReclaimPolicy` 기본값은 `Retain` — 안 박아도 답으로 인정되지만, 문제에 명시되어 있으면 명시적으로 적어두는 게 안전.
+> ⚠️ `50Mi` 는 50 _MiB_ (binary, 1024²). `50M` 은 50 _MB_ (decimal, 1000²) — 문제가 `50MiB` 면 `Mi` 가 정답.
